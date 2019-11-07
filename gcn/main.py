@@ -2,7 +2,11 @@ from __future__ import division
 from __future__ import print_function
 
 import time
+import os
 import tensorflow as tf
+from scipy import sparse
+from sklearn.preprocessing import MultiLabelBinarizer
+from collections import defaultdict
 
 from gcn.utils import *
 from gcn.models import GCN, MLP
@@ -17,21 +21,46 @@ flags = tf.app.flags
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset', 'pubmed', 'Dataset string.')  # 'cora', 'citeseer', 'pubmed'
 flags.DEFINE_string('model', 'gcn', 'Model string.')  # 'gcn', 'gcn_cheby', 'dense'
-flags.DEFINE_float('learning_rate', 0.01, 'Initial learning rate.')
+flags.DEFINE_float('learning_rate', 0.001, 'Initial learning rate.')
 flags.DEFINE_integer('epochs', 200, 'Number of epochs to train.')
 flags.DEFINE_integer('hidden1', 16, 'Number of units in hidden layer 1.')
 flags.DEFINE_float('dropout', 0.5, 'Dropout rate (1 - keep probability).')
 flags.DEFINE_float('weight_decay', 5e-4, 'Weight for L2 loss on embedding matrix.')
 flags.DEFINE_integer('early_stopping', 10, 'Tolerance for early stopping (# of epochs).')
 flags.DEFINE_integer('max_degree', 3, 'Maximum Chebyshev polynomial degree.')
+flags.DEFINE_string('output_filename', 'tmp', '')
+flags.DEFINE_string('input_dir', '/home/tuke/mle/data/pubmed/', '')
+flags.DEFINE_boolean('debug', True, 'enable ouput for debug')
 
+def my_load_data(input_dir):
+    G = nx.read_edgelist(os.path.join(input_dir, 'graph.edgelist'), nodetype=int)
+    adj = nx.adjacency_matrix(G)
+    feature_filename = os.path.join(input_dir, 'features.npz')
+    #features = sparse.lil_matrix(adj).astype(float)
+    features = sparse.load_npz(feature_filename).tolil()
+    mlb = MultiLabelBinarizer()
+    labels = np.loadtxt(os.path.join(input_dir, 'label.txt'), dtype=int)
+    d = defaultdict(list)
+    for x, y in labels:
+        d[x].append(y)
+    y = [d[i] for i in range(G.number_of_nodes())]
+    labels = mlb.fit_transform(y)
+    ind_train = np.loadtxt(os.path.join(input_dir, 'label_mask_train'), dtype=int)
+    ind_test = np.loadtxt(os.path.join(input_dir, 'label_mask_test'), dtype=int)
+    train_mask = sample_mask(ind_train, labels.shape[0])
+    test_mask = sample_mask(ind_test, labels.shape[0])
+    y_train, y_test = np.zeros(labels.shape), np.zeros(labels.shape)
+    y_train[train_mask, :] = labels[train_mask, :]
+    y_test[test_mask, :] = labels[test_mask, :]
+    return adj, features, y_train, y_test, train_mask, test_mask
 # Load data
-adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data(FLAGS.dataset)
-
+adj, features, y_train, y_test, train_mask, test_mask = my_load_data(FLAGS.input_dir)
 print(type(adj), type(features), type(y_train), type(train_mask))
-
+#adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data(FLAGS.dataset)
+print(adj.shape, features.shape)
 # Some preprocessing
 features = preprocess_features(features)
+#features = preprocess_features(features)
 if FLAGS.model == 'gcn':
     support = [preprocess_adj(adj)]
     num_supports = 1
@@ -60,9 +89,11 @@ placeholders = {
 # Create model
 model = model_func(placeholders, input_dim=features[2][1], logging=True)
 
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
 # Initialize session
-sess = tf.Session()
-
+sess = tf.Session(config=config)
+#sess = tf.Session()
 
 # Define model evaluation function
 def evaluate(features, support, labels, mask, placeholders):
@@ -82,29 +113,42 @@ for epoch in range(FLAGS.epochs):
 
     t = time.time()
     # Construct feed dictionary
-    print("#######################", y_train.shape, train_mask.shape)
     feed_dict = construct_feed_dict(features, support, y_train, train_mask, placeholders)
     feed_dict.update({placeholders['dropout']: FLAGS.dropout})
 
     # Training step
     outs = sess.run([model.opt_op, model.loss, model.accuracy], feed_dict=feed_dict)
+    if FLAGS.debug:
+        print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(outs[1]),
+              "train_acc=", "{:.5f}".format(outs[2]), "time=", "{:.5f}".format(time.time() - t))
+        test_cost, test_acc, test_duration = evaluate(features, support, y_test, test_mask, placeholders)
+        print("Test set results:", "cost=", "{:.5f}".format(test_cost),
+            "accuracy=", "{:.5f}".format(test_acc), "time=", "{:.5f}".format(test_duration))
 
+    """
     # Validation
     cost, acc, duration = evaluate(features, support, y_val, val_mask, placeholders)
     cost_val.append(cost)
 
     # Print results
-    print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(outs[1]),
-          "train_acc=", "{:.5f}".format(outs[2]), "val_loss=", "{:.5f}".format(cost),
-          "val_acc=", "{:.5f}".format(acc), "time=", "{:.5f}".format(time.time() - t))
+    if FLAGS.debug:
+        print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(outs[1]),
+              "train_acc=", "{:.5f}".format(outs[2]), "val_loss=", "{:.5f}".format(cost),
+              "val_acc=", "{:.5f}".format(acc), "time=", "{:.5f}".format(time.time() - t))
 
     if epoch > FLAGS.early_stopping and cost_val[-1] > np.mean(cost_val[-(FLAGS.early_stopping+1):-1]):
-        print("Early stopping...")
+        if FLAGS.debug:
+            print("Early stopping...")
         break
-
-print("Optimization Finished!")
+    """
+if FLAGS.debug:
+    print("Optimization Finished!")
 
 # Testing
 test_cost, test_acc, test_duration = evaluate(features, support, y_test, test_mask, placeholders)
-print("Test set results:", "cost=", "{:.5f}".format(test_cost),
-      "accuracy=", "{:.5f}".format(test_acc), "time=", "{:.5f}".format(test_duration))
+if FLAGS.debug:
+    print("Test set results:", "cost=", "{:.5f}".format(test_cost),
+        "accuracy=", "{:.5f}".format(test_acc), "time=", "{:.5f}".format(test_duration))
+os.makedirs(os.path.dirname(FLAGS.output_filename), exist_ok=True)
+with open(FLAGS.output_filename, 'w') as f:
+    print("{:.4f}".format(test_acc), file=f)
